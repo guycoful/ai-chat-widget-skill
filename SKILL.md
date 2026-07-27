@@ -1,24 +1,29 @@
 ---
 name: ai-chat-widget
 description: >-
-  בניית צ'אטבוט AI מלא לאתר React+Vite+Supabase — bubble widget בתחתית המסך, RTL עברית, שמירת שיחות ב-Supabase, Edge Function עם Claude, ופאנל אדמין. השתמש בסקיל זה כשמישהו אומר "תוסיף לי צ'אטבוט לאתר", "רוצה בוט בעברית באתר", "ai chat widget", "widget צ'אט", "צ'אטבוט על האתר", או כשצריך לבנות שירות לקוחות אוטומטי שמשתלב באתר React קיים. הסקיל מספק קוד מוכן לשימוש בהתאמה אישית מינימלית.
+  בניית צ'אטבוט AI מלא לאתר React+Vite+Supabase — bubble widget בתחתית המסך, RTL עברית, שמירת שיחות ב-Supabase, Edge Function עם Claude, מידע עסקי הניתן לעריכה בלי redeploy, rate limiting נגד ניצול לרעה, ופאנל אדמין. השתמש בסקיל זה כשמישהו אומר "תוסיף לי צ'אטבוט לאתר", "רוצה בוט בעברית באתר", "ai chat widget", "widget צ'אט", "צ'אטבוט על האתר", או כשצריך לבנות שירות לקוחות אוטומטי שמשתלב באתר React קיים. הסקיל מספק קוד מוכן לשימוש בהתאמה אישית מינימלית.
 ---
 
 # AI Chat Widget — צ'אטבוט מלא לאתר
 
 סקיל זה מוציא צ'אטבוט AI עובד לאתר React תוך פחות מ-30 דקות. הארכיטקטורה נבדקה בפרודקשן על guycohen-ai.co.il.
 
+**חשוב להבין לפני שמתחילים:** זה לא RAG וקטורי. מידע עסקי (שעות, מחירים, קטלוג) נטען מטבלת `chat_knowledge` בכל בקשה ומצורף ל-system prompt - מספיק לעסק קטן-בינוני עם עד כ-100 פריטי מידע קצרים, לא מתאים לקטלוג גדול/משתנה בזמן אמת. ראה שלב 2.
+
 ## ארכיטקטורה
 
 ```
-[React ChatWidget] → [Supabase Edge Function: chat-respond] → [Claude API]
-       ↕                           ↕
-[localStorage]           [Supabase DB: conversations + messages]
-                                   ↕
-                         [Admin Panel /admin/chat]
+[React ChatWidget / embed-widget.js] → [Supabase Edge Function: chat-respond] → [Claude API]
+              ↕ (GET: היסטוריה/polling)              ↕                              ↑
+        [localStorage: conversationId]      [Supabase DB: conversations + messages    │
+                                              + chat_knowledge + chat_rate_limits] ────┘
+                                                        ↕
+                                              [Admin Panel /admin/chat]
 ```
 
-**Stack:** React 18 + Vite + Tailwind + shadcn/ui + Supabase + Claude API (Anthropic)
+**חשוב:** ה-widget (React או embed) אף פעם לא מדבר עם Supabase ישירות. כל קריאה וכתיבה עוברות דרך ה-Edge Function, שמשתמשת ב-service_role key ועוקפת RLS. זה לא רק ניקיון ארכיטקטורה - זה מה שמונע מכל מי שמחזיק את ה-anon key הציבורי (למשל מה-embed script) לקרוא ישירות את כל השיחות של כל הלקוחות. ראה אזהרה בשלב 1.
+
+**Stack:** React 18 + Vite + Tailwind + shadcn/ui + Supabase (DB + Edge Functions) + Claude API (Anthropic)
 
 ---
 
@@ -45,143 +50,88 @@ CREATE TABLE public.chat_messages (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- knowledge base: מידע עסקי (שעות, מחירים, קטלוג) שנטען דינמית לתוך ה-system prompt.
+-- לא RAG וקטורי - טעינה מלאה של כל השורות הפעילות בכל בקשה. ראה שלב 2 להסבר.
+CREATE TABLE public.chat_knowledge (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  topic TEXT NOT NULL,
+  content TEXT NOT NULL,
+  active BOOLEAN NOT NULL DEFAULT true,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- rate limiting: כמה הודעות הגיעו מכל IP בכל חלון-שעה, כדי לא לתת לאף אחד לבזבז
+-- את יתרת ה-Claude API שלכם. ראה increment_chat_rate_limit למטה.
+CREATE TABLE public.chat_rate_limits (
+  ip TEXT NOT NULL,
+  window_start TIMESTAMPTZ NOT NULL,
+  count INT NOT NULL DEFAULT 1,
+  PRIMARY KEY (ip, window_start)
+);
+
 -- RLS
 ALTER TABLE public.chat_conversations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.chat_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.chat_knowledge ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.chat_rate_limits ENABLE ROW LEVEL SECURITY;
 
--- Allow anonymous reads/inserts (widget needs this without auth)
-CREATE POLICY "public_insert_conversations" ON public.chat_conversations
-  FOR INSERT TO anon WITH CHECK (true);
+-- ⚠️ אין אף policy ל-anon על אף אחת מהטבלאות האלה, בכוונה. ה-widget (React או embed)
+-- לעולם לא מדבר עם Supabase ישירות - כל קריאה וכתיבה עוברות דרך ה-Edge Function
+-- (chat-respond) שמשתמשת ב-service_role key, שעוקף RLS לגמרי. RLS עם anon USING(true)
+-- שהיה כאן בגרסה קודמת של הסקיל היה חור אבטחה אמיתי: כל מי שמחזיק את ה-anon key
+-- (שנחשף בכוונה בעמוד ציבורי, כולל בembed script) יכול היה לקרוא/לייצא את כל השיחות
+-- של כל הלקוחות אי פעם - שמות, מיילים, תוכן מלא - בקריאת REST אחת בלי אפילו לדעת
+-- conversation_id ספציפי. אם התקנתם גרסה קודמת: הריצו מיד
+-- `DROP POLICY "public_select_conversations" ON public.chat_conversations;`
+-- `DROP POLICY "public_select_messages" ON public.chat_messages;`
+-- ואל תחזירו policy כללית ל-anon על הטבלאות האלה.
 
-CREATE POLICY "public_select_conversations" ON public.chat_conversations
-  FOR SELECT TO anon USING (true);
-
-CREATE POLICY "public_insert_messages" ON public.chat_messages
-  FOR INSERT TO anon WITH CHECK (true);
-
-CREATE POLICY "public_select_messages" ON public.chat_messages
-  FOR SELECT TO anon USING (true);
-
--- Admin can update (status changes, admin messages)
+-- ניהול (עדכון סטטוס, תשובת אדמין) - authenticated בלבד. אותה הערה כמו בsקיל
+-- meeting-scheduler: אם ה-Admin Panel (שלב 4) לא באמת מתחבר עם supabase.auth
+-- (email+password אמיתי) אלא רק בודק סיסמה קבועה בצד לקוח, ה-policies האלה לא
+-- ישרתו אותו בפועל - שדרגו את פאנל הניהול ל-Supabase Auth אמיתי לפני production.
 CREATE POLICY "auth_update_conversations" ON public.chat_conversations
   FOR UPDATE TO authenticated USING (true);
 
 CREATE POLICY "auth_all_messages" ON public.chat_messages
   FOR ALL TO authenticated USING (true);
+
+CREATE POLICY "auth_manage_knowledge" ON public.chat_knowledge
+  FOR ALL TO authenticated USING (true) WITH CHECK (true);
+
+-- פונקציית עזר ל-rate limiting אטומי (upsert+increment יחיד, לא select-then-update -
+-- אותה עקרון כמו התיקון ל-double-booking בsקיל meeting-scheduler).
+CREATE OR REPLACE FUNCTION public.increment_chat_rate_limit(p_ip TEXT, p_window_start TIMESTAMPTZ)
+RETURNS INT
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  new_count INT;
+BEGIN
+  INSERT INTO public.chat_rate_limits (ip, window_start, count)
+  VALUES (p_ip, p_window_start, 1)
+  ON CONFLICT (ip, window_start)
+  DO UPDATE SET count = chat_rate_limits.count + 1
+  RETURNING count INTO new_count;
+  RETURN new_count;
+END;
+$$;
 ```
+
+**איך עורכים מידע עסקי בפועל:** Supabase Dashboard → Table Editor → `chat_knowledge` → הוספת שורה. לדוגמה `topic: "שעות פתיחה"`, `content: "א-ה 9:00-19:00, ו 9:00-14:00"`. אין ממשק ניהול ייעודי בגרסה הבסיסית - עריכה ישירה בטבלה, בלי redeploy ובלי לגעת בקוד.
 
 ---
 
 ## שלב 2: Edge Function — chat-respond
 
-צור ב-Supabase: Dashboard → Edge Functions → New Function → `chat-respond`
+צור ב-Supabase: Dashboard → Edge Functions → New Function → `chat-respond`, והדבק את הקוד מ-`references/chat-respond-function.ts`.
 
-```typescript
-// supabase/functions/chat-respond/index.ts
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+**מה יש בגרסה הזו שלא היה בגרסה הקודמת:**
 
-const ANTHROPIC_API_KEY = Deno.env.get("ANTHROPIC_API_KEY")!;
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-
-// *** התאם כאן: system prompt לעסק ***
-const SYSTEM_PROMPT = `אתה העוזר הדיגיטלי של [שם העסק].
-תפקידך לענות על שאלות לגבי [תחום העסק].
-
-מידע חשוב:
-- [כאן שם, שירותים, מחירים, שעות]
-
-כללים:
-- ענה תמיד בעברית, קצר וברור
-- אם שואלים משהו שאינך יודע, אמור "אבדוק ואחזור אליך"
-- כשהלקוח מבקש נציג אנושי, ענה עם המילה HUMAN_NEEDED בתחילת התגובה
-- אל תמציא מידע שלא ניתן לך`;
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-};
-
-serve(async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
-
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
-  const { conversationId, message, visitorName } = await req.json();
-
-  // Create or get conversation
-  let convId = conversationId;
-  if (!convId) {
-    const { data: conv } = await supabase
-      .from("chat_conversations")
-      .insert({ visitor_name: visitorName || "אנונימי" })
-      .select("id")
-      .single();
-    convId = conv!.id;
-  }
-
-  // Save visitor message
-  await supabase.from("chat_messages").insert({
-    conversation_id: convId,
-    role: "visitor",
-    content: message,
-  });
-
-  // Load history (last 20 messages for context)
-  const { data: history } = await supabase
-    .from("chat_messages")
-    .select("role, content")
-    .eq("conversation_id", convId)
-    .order("created_at", { ascending: true })
-    .limit(20);
-
-  const claudeMessages = (history || []).map((m) => ({
-    role: m.role === "visitor" ? "user" : "assistant",
-    content: m.content,
-  }));
-
-  // Call Claude
-  const claudeRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 500,
-      system: SYSTEM_PROMPT,
-      messages: claudeMessages,
-    }),
-  });
-
-  const claudeData = await claudeRes.json();
-  let reply = claudeData.content?.[0]?.text || "סליחה, לא הצלחתי לענות. נסה שוב.";
-
-  // Check for human handoff signal
-  const humanNeeded = reply.startsWith("HUMAN_NEEDED");
-  if (humanNeeded) {
-    reply = reply.replace("HUMAN_NEEDED", "").trim();
-    await supabase.from("chat_conversations")
-      .update({ status: "human_needed" })
-      .eq("id", convId);
-  }
-
-  // Save AI reply
-  await supabase.from("chat_messages").insert({
-    conversation_id: convId,
-    role: "ai",
-    content: reply,
-  });
-
-  return new Response(
-    JSON.stringify({ reply, conversationId: convId, humanNeeded }),
-    { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-  );
-});
-```
+1. **Rate limiting אמיתי** - כל בקשת POST בודקת קודם, דרך פונקציית `increment_chat_rate_limit`, כמה הודעות הגיעו מה-IP הזה בשעה הנוכחית. מעל `MAX_MESSAGES_PER_HOUR` (ברירת מחדל 30) - הבקשה נדחית עם 429 לפני שנשלחת קריאה ל-Claude בכלל, אז זה לא רק "לא עונים", זה בפועל חוסך טוקנים. בלי זה, כל אחד שמוצא את `EDGE_FN_URL` יכול לשגר בקשות ישירות (בלי לעבור דרך ה-widget) ולצרוך יתרה בלי הגבלה.
+2. **מידע עסקי דינמי מ-`chat_knowledge`** - לפני קריאה ל-Claude, הפונקציה טוענת את כל השורות הפעילות מהטבלה ומצרפת אותן ל-system prompt תחת "מידע עדכני על העסק". זה **לא RAG וקטורי** - אין embeddings, אין חיפוש סמנטי, זו טעינה מלאה של כל הטבלה בכל בקשה. בשביל עסק קטן (שעות, מדיניות, קטלוג של עד כ-100 פריטים קצרים) זה מספיק ופותר את הבעיה המרכזית: אתם מעדכנים מחיר בטבלה ב-Supabase, לא בקוד, ובלי redeploy. אם הקטלוג שלכם גדול או משתנה כל הזמן (מלאי בזמן אמת, מאות SKUs) - זה לא יספיק, תצטרכו שכבת חיפוש אמיתית (pgvector) שלא כלולה כאן.
+3. **טיפול ב-GET** (`?conversationId=X`) - מחזיר את היסטוריית ההודעות של שיחה. זה מה שמאפשר ל-widget (React או embed) לטעון/לרענן היסטוריה **בלי** לקרוא ל-Supabase ישירות עם ה-anon key - ראה אזהרת ה-RLS בשלב 1 למעלה, זו הסיבה שהשינוי הזה הכרחי ולא רק "ניקיון קוד".
 
 **ENV Variables** (Supabase Dashboard → Edge Functions → Secrets):
 - `ANTHROPIC_API_KEY` — מ-console.anthropic.com
@@ -220,20 +170,25 @@ import ChatWidget from "@/components/ChatWidget";
 אם הלקוח רוצה לענות בעצמו על שיחות שדרשו נציג:
 - קובץ: `src/pages/AdminChat.tsx`
 - Route: `/admin/chat`
-- כניסה עם סיסמה (localStorage token)
+- כניסה עם סיסמה
 - רשימת שיחות + ענייה ישירה
+
+**⚠️ אם אתם בונים את הקובץ הזה:** תתחברו עם `supabase.auth.signInWithPassword()` אמיתי (משתמש שנוצר ב-Dashboard → Authentication → Users), לא סיסמה קבועה בקוד + localStorage token. ה-policies `auth_update_conversations`/`auth_all_messages` בשלב 1 מוגבלות ל-`TO authenticated` - בלי session אמיתי מ-supabase.auth הן לא ישרתו כלום. אותה נקודה בדיוק שתוקנה בsקיל `meeting-scheduler-skill`, ראה שם דוגמה מלאה ל-`AdminBookings.tsx` עם auth אמיתי אם אתם רוצים תבנית.
 
 ---
 
 ## Checklist לפני Deploy
 
-- [ ] Migration SQL הורץ ב-Supabase
-- [ ] Edge Function נפרסה ו-ENV Variables הוגדרו
+- [ ] Migration SQL הורץ ב-Supabase (כולל `chat_knowledge`, `chat_rate_limits`, ופונקציית `increment_chat_rate_limit`)
+- [ ] Edge Function נפרסה מ-`references/chat-respond-function.ts` ו-ENV Variables הוגדרו
 - [ ] `EDGE_FN_URL` עודכן ל-Project Ref הנכון
-- [ ] System prompt הותאם לעסק (שם, שירותים, כללים)
+- [ ] System prompt הותאם לעסק (שם, תחום, כללים) - הפרטים הספציפיים (מחירים/שעות/קטלוג) נכנסים ל-`chat_knowledge`, לא לקוד
+- [ ] נוספה לפחות שורה אחת ב-`chat_knowledge` ונבדק שה-AI משתמש בה בתשובה
 - [ ] greeting text ו-teaser text הותאמו
 - [ ] Widget מחובר ב-App.tsx
 - [ ] בדיקת שיחה מלאה: שלח הודעה → קבל תשובה → בדוק בטבלה ב-Supabase
+- [ ] נבדק rate limiting: שליחת יותר מ-`MAX_MESSAGES_PER_HOUR` הודעות מחזירה הודעת "עברת את המכסה" ולא קוראת ל-Claude
+- [ ] נבדק: קריאת REST ישירה ל-`chat_messages`/`chat_conversations` עם ה-anon key (בלי לעבור דרך ה-Edge Function) נכשלת - זו הבדיקה שמוודאת שה-RLS fix אכן פעיל
 
 ---
 
@@ -294,12 +249,12 @@ https://cdn.jsdelivr.net/gh/USERNAME/REPO@main/embed-widget.js
 
 ### Checklist לפני Deploy (Embed)
 
-- [ ] שלבים 1-2 בוצעו (SQL + Edge Function)
+- [ ] שלבים 1-2 בוצעו (SQL + Edge Function, כולל `chat_knowledge`/`chat_rate_limits`)
 - [ ] `edgeFnUrl` מצביע לפרויקט הנכון
 - [ ] `businessName` ו-`greeting` הותאמו לעסק
-- [ ] System prompt בשלב 2 הותאם לעסק
+- [ ] System prompt בשלב 2 הותאם לעסק, פרטים ספציפיים נמצאים ב-`chat_knowledge`
 - [ ] קובץ JS מוגש מ-HTTPS (לא HTTP)
-- [ ] בדיקת שיחה מלאה מהאתר של הלקוח
+- [ ] בדיקת שיחה מלאה מהאתר של הלקוח, כולל טעינת היסטוריה אחרי רענון דף
 
 ---
 
@@ -322,3 +277,5 @@ https://cdn.jsdelivr.net/gh/USERNAME/REPO@main/embed-widget.js
 ## Reference Files
 
 - `references/ChatWidget.tsx` — קוד React מלא (מוכן להעתקה)
+- `references/embed-widget.js` — סקריפט JS עצמאי לכל אתר
+- `references/chat-respond-function.ts` — Edge Function: rate limiting, מידע עסקי דינמי, טיפול ב-GET להיסטוריה/polling

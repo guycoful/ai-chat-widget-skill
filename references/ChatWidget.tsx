@@ -1,10 +1,21 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { MessageCircle, X, Send, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { supabase } from "@/integrations/supabase/client";
 
 const EDGE_FN_URL =
   "https://vuvavjmbvdqnwtleudqh.supabase.co/functions/v1/chat-respond";
+
+// טעינת היסטוריה/polling עוברים דרך ה-Edge Function (GET), לא supabase.from() ישיר.
+// הסיבה: ה-RLS על chat_messages לא מעניק ל-anon אף הרשאת SELECT בכוונה (ראה SKILL.md
+// שלב 1) - כתיבה וקריאה עוברות רק דרך ה-Edge Function עם service_role. קריאה ישירה
+// מה-widget הייתה מחייבת policy פתוחה ל-anon, וזה בדיוק מה שחשף בעבר את כל השיחות
+// של כל הלקוחות לכל מי שמחזיק את ה-anon key הציבורי.
+async function fetchMessages(conversationId: string): Promise<Message[]> {
+  const res = await fetch(`${EDGE_FN_URL}?conversationId=${conversationId}`);
+  if (!res.ok) return [];
+  const json = await res.json();
+  return (json.messages || []) as Message[];
+}
 
 const LS_CONV_KEY = "chat_conversation_id";
 const LS_NAME_KEY = "chat_visitor_name";
@@ -69,19 +80,8 @@ const ChatWidget = () => {
     if (!conversationId) return;
 
     const loadMessages = async () => {
-      const { data, error } = await supabase
-        .from("chat_messages" as any)
-        .select("id, role, content, created_at")
-        .eq("conversation_id", conversationId)
-        .order("created_at", { ascending: true });
-
-      if (!error && data && (data as any[]).length > 0) {
-        const loaded = (data as any[]).map((m: any) => ({
-          id: m.id,
-          role: m.role as Message["role"],
-          content: m.content,
-          created_at: m.created_at,
-        }));
+      const loaded = await fetchMessages(conversationId);
+      if (loaded.length > 0) {
         setMessages(loaded);
         setGreeted(true);
         lastSeenCountRef.current = loaded.length;
@@ -96,35 +96,23 @@ const ChatWidget = () => {
     if (!conversationId) return;
 
     const poll = setInterval(async () => {
-      const { data, error } = await supabase
-        .from("chat_messages" as any)
-        .select("id, role, content, created_at")
-        .eq("conversation_id", conversationId)
-        .order("created_at", { ascending: true });
+      const fetched = await fetchMessages(conversationId);
+      if (fetched.length === 0) return;
 
-      if (!error && data) {
-        const fetched = (data as any[]).map((m: any) => ({
-          id: m.id,
-          role: m.role as Message["role"],
-          content: m.content,
-          created_at: m.created_at,
-        }));
+      if (fetched.length > lastSeenCountRef.current) {
+        setMessages(fetched);
 
-        if (fetched.length > lastSeenCountRef.current) {
-          setMessages(fetched);
-
-          // Count new admin messages since last seen
-          if (!open) {
-            const newAdminMsgs = fetched
-              .slice(lastSeenCountRef.current)
-              .filter((m) => m.role === "admin");
-            if (newAdminMsgs.length > 0) {
-              setUnreadCount((prev) => prev + newAdminMsgs.length);
-            }
+        // Count new admin messages since last seen
+        if (!open) {
+          const newAdminMsgs = fetched
+            .slice(lastSeenCountRef.current)
+            .filter((m) => m.role === "admin");
+          if (newAdminMsgs.length > 0) {
+            setUnreadCount((prev) => prev + newAdminMsgs.length);
           }
-
-          lastSeenCountRef.current = fetched.length;
         }
+
+        lastSeenCountRef.current = fetched.length;
       }
     }, 10000);
 
