@@ -25,11 +25,15 @@ description: >-
 
 **Stack:** React 18 + Vite + Tailwind + shadcn/ui + Supabase (DB + Edge Functions) + Claude API (Anthropic)
 
+**הערה ל-Claude Code שמריץ את הסקיל הזה:** אם יש חיבור MCP ל-Supabase, תבצע את כל שלבי ה-SQL וה-Edge Function ישירות (`mcp__supabase__execute_sql` / `apply_migration` ל-SQL, `mcp__supabase__deploy_edge_function` ל-Edge Function) - אל תבקש מהמשתמש לפתוח את דשבורד Supabase ולהדביק דברים בעצמו. הוראות ה-"הרץ ב-SQL Editor" למטה מיועדות למי שאין לו MCP מחובר או מעדיף לעשות את זה ידנית.
+
 ---
 
 ## שלב 1: בסיס נתונים — SQL Migrations
 
-הרץ ב-Supabase SQL Editor:
+**עם Supabase MCP מחובר:** תבצע את ה-SQL הבא ישירות דרך `execute_sql`/`apply_migration`, אל תבקש מהמשתמש להריץ אותו בעצמו.
+
+**בלי MCP:** הרץ ב-Supabase SQL Editor:
 
 ```sql
 -- conversations
@@ -125,7 +129,9 @@ $$;
 
 ## שלב 2: Edge Function — chat-respond
 
-צור ב-Supabase: Dashboard → Edge Functions → New Function → `chat-respond`, והדבק את הקוד מ-`references/chat-respond-function.ts`.
+**עם Supabase MCP מחובר:** תפרוס את `references/chat-respond-function.ts` ישירות עם `mcp__supabase__deploy_edge_function` בשם `chat-respond`.
+
+**בלי MCP:** צור ב-Supabase Dashboard → Edge Functions → New Function → `chat-respond`, והדבק את הקוד מ-`references/chat-respond-function.ts`.
 
 **מה יש בגרסה הזו שלא היה בגרסה הקודמת:**
 
